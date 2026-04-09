@@ -84,10 +84,31 @@ APP_BUILD    = "2025.enterprise"
 AI_THRESHOLD_DEFAULT = 0.82
 BADGE_HOLD_MS        = 6000    # ms badge stays solid
 BADGE_FADE_MS        = 1800    # ms fade animation
-MOTION_DEBOUNCE      = 280     # ms between motion ticks
 DEDUP_TTL            = 90      # s before re-analyzing same hash
 MAX_REGIONS          = 20      # max simultaneous badges
 MAX_WORKERS          = 4       # API concurrency
+
+# Browser-aware watcher timings
+FRAME_POLL_MS        = 120     # ms between frame grabs when browser is active
+WINDOW_POLL_MS       = 1200    # ms between foreground window checks
+STATIC_RESCAN_MS     = 8000    # ms re-verify static media that hasn't changed
+MIN_MEDIA_W          = 120     # px minimum image/video width to analyse
+MIN_MEDIA_H          = 90      # px minimum image/video height to analyse
+MOTION_DEBOUNCE      = 180     # ms cooldown after a motion region fires
+
+# Known browser / PWA window-class and title fragments (case-insensitive)
+BROWSER_WM_CLASSES = {
+    "chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
+    "chrome", "brave-browser", "brave", "microsoft-edge", "msedge",
+    "firefox", "firefox-esr", "waterfox", "librewolf",
+    "opera", "vivaldi", "epiphany", "falkon", "midori",
+    # Electron / PWA shells
+    "electron", "nwjs",
+}
+BROWSER_TITLE_FRAGMENTS = {
+    "google chrome", "chromium", "firefox", "brave",
+    "microsoft edge", "opera", "vivaldi",
+}
 
 # Cost estimation (Sightengine free: 500/month, $0.001/call thereafter)
 COST_PER_CALL_USD    = 0.001
@@ -508,11 +529,25 @@ class BloomFilter:
 #  ENCRYPTED CREDENTIAL STORE
 # ══════════════════════════════════════════════════════════════════════════════
 def _derive_key() -> bytes:
-    """Derive a machine-specific Fernet key from host identifiers."""
+    """Derive a stable, machine-specific Fernet key from host identifiers.
+
+    Must be fully deterministic across process restarts — never include
+    process-transient values like PID.  Uses USER + HOME + uid + hostname,
+    all of which are stable for the lifetime of a user account on a machine.
+    """
+    try:
+        import socket
+        hostname = socket.gethostname()
+    except Exception:
+        hostname = "localhost"
+
+    uid_part = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("COMPUTERNAME", "")
+
     seed = (
-        os.environ.get("USER", "") +
-        os.environ.get("HOME", "") +
-        str(os.getpid() // 1000)   # stable per user session
+        os.environ.get("USER", os.environ.get("USERNAME", "")) +
+        os.environ.get("HOME",  os.environ.get("USERPROFILE", "")) +
+        uid_part +
+        hostname
     ).encode()
     h = hashlib.sha256(seed).digest()
     return base64.urlsafe_b64encode(h)
@@ -542,20 +577,28 @@ class Config:
         api_user                = "",
         api_secret              = "",
         api_secret_enc          = "",   # encrypted form
-        interval_ms             = 4000,
         retry_max               = 3,
         retry_backoff_ms        = 600,
         score_blend             = "average",  # average|maximum|weighted_avg|ensemble_vote
+        # Browser-aware watcher
+        browser_only_mode       = True,   # only scan when a browser/PWA is active
+        browser_wm_classes      = [],     # extra WM_CLASS strings to treat as browsers
+        browser_title_fragments = [],     # extra title substrings to treat as browsers
+        scan_all_visible        = False,  # scan all visible browser windows, not just foreground
+        static_rescan_ms        = STATIC_RESCAN_MS,
+        media_min_w             = MIN_MEDIA_W,
+        media_min_h             = MIN_MEDIA_H,
+        media_require_aspect    = True,   # skip regions with square-ish UI-like aspect ratio
         # Detection
         threshold               = AI_THRESHOLD_DEFAULT,
         monitor_index           = 0,
-        motion_min_px           = 100,
+        motion_min_px           = 80,
         burst_frames            = 3,
         burst_gap_ms            = 200,
         dedup_enabled           = True,
         dedup_hamming_tolerance = 4,    # treat hashes within N bits as same
-        entropy_filter          = False,
-        entropy_min             = 4.5,  # skip low-entropy regions (solid color)
+        entropy_filter          = True,
+        entropy_min             = 4.2,  # skip low-entropy regions (solid color / UI chrome)
         # Badge
         badge_style             = "circle",
         badge_opacity           = 0.90,
@@ -1116,6 +1159,9 @@ class APIWorker(QThread):
     done  = pyqtSignal(dict, list, str, float, float)   # result, coords, phash, entropy, latency
     error = pyqtSignal(str, str)
 
+    # Class-level throttle: emit NO_CREDENTIALS warning at most once per 60 s
+    _last_no_cred_warn: float = 0.0
+
     def __init__(self, frames: List[bytes], coords: list, ph: str,
                  entropy: float, config: Config):
         super().__init__()
@@ -1129,7 +1175,10 @@ class APIWorker(QThread):
         u = str(self.config.api_user).strip()
         s = str(self.config.api_secret).strip()
         if not u or not s:
-            self.error.emit("NO_CREDENTIALS", self.phash)
+            now = time.time()
+            if now - APIWorker._last_no_cred_warn >= 60.0:
+                APIWorker._last_no_cred_warn = now
+                self.error.emit("NO_CREDENTIALS", self.phash)
             return
 
         last_err = None
@@ -1457,34 +1506,408 @@ class BadgeManager:
         return len(self._badges)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCREEN MONITOR
+#  BROWSER WINDOW TRACKER
+#  Enumerates visible browser / PWA windows via xdotool (Linux) or platform
+#  APIs, returning their screen geometry so the frame grabber knows where to
+#  look.  Falls back gracefully to full-screen monitoring if xdotool is absent.
+# ══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class BrowserWindow:
+    wid:    int
+    pid:    int
+    x:      int
+    y:      int
+    w:      int
+    h:      int
+    title:  str
+    wm_cls: str
+    active: bool = False
+
+    @property
+    def rect(self) -> Tuple[int, int, int, int]:
+        return (self.x, self.y, self.w, self.h)
+
+
+class BrowserWindowTracker:
+    """
+    Detects which windows on screen are browsers / PWAs and returns their
+    geometry.  Uses xdotool on Linux, AppleScript on macOS, win32api on
+    Windows.  Falls back to full-monitor geometry if detection is unavailable.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self._cache: List[BrowserWindow] = []
+        self._last_refresh: float = 0.0
+        self._xdotool_ok: Optional[bool] = None   # None = untested
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def refresh(self) -> List[BrowserWindow]:
+        """Re-query the window list. Returns the new list."""
+        self._cache = self._enumerate()
+        self._last_refresh = time.time()
+        return self._cache
+
+    def cached(self) -> List[BrowserWindow]:
+        return self._cache
+
+    def any_active(self) -> bool:
+        return any(w.active for w in self._cache)
+
+    def foreground(self) -> Optional[BrowserWindow]:
+        for w in self._cache:
+            if w.active:
+                return w
+        return None
+
+    # ── Platform enumeration ──────────────────────────────────────────────────
+
+    def _enumerate(self) -> List[BrowserWindow]:
+        try:
+            if sys.platform.startswith("linux"):
+                return self._enumerate_linux()
+            elif sys.platform == "darwin":
+                return self._enumerate_mac()
+            elif sys.platform == "win32":
+                return self._enumerate_win()
+        except Exception as e:
+            log.debug(f"BrowserWindowTracker._enumerate: {e}")
+        return []
+
+    # ── Linux (xdotool + xprop) ───────────────────────────────────────────────
+
+    def _xdotool(self, *args) -> str:
+        """Run xdotool with the given args, return stdout."""
+        r = subprocess.run(
+            ["xdotool"] + list(args),
+            capture_output=True, text=True, timeout=2,
+        )
+        return r.stdout.strip()
+
+    def _enumerate_linux(self) -> List[BrowserWindow]:
+        # Test xdotool once
+        if self._xdotool_ok is None:
+            try:
+                subprocess.run(["xdotool", "version"],
+                               capture_output=True, timeout=2)
+                self._xdotool_ok = True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                self._xdotool_ok = False
+                log.warning(
+                    "xdotool not found — browser-aware mode degraded to full-screen. "
+                    "Install with: sudo apt install xdotool"
+                )
+
+        if not self._xdotool_ok:
+            return self._fallback_fullscreen()
+
+        try:
+            active_wid_str = self._xdotool("getactivewindow")
+            active_wid = int(active_wid_str) if active_wid_str.isdigit() else -1
+        except Exception:
+            active_wid = -1
+
+        # Get all window IDs on all desktops
+        try:
+            all_wids_raw = self._xdotool("search", "--all", "--onlyvisible",
+                                          "--desktop", "all", "--name", "")
+        except Exception:
+            all_wids_raw = ""
+
+        wids = [int(x) for x in all_wids_raw.splitlines() if x.strip().isdigit()]
+
+        results: List[BrowserWindow] = []
+        all_classes = BROWSER_WM_CLASSES | {
+            c.lower() for c in self.config.browser_wm_classes
+        }
+        all_title_frags = BROWSER_TITLE_FRAGMENTS | {
+            f.lower() for f in self.config.browser_title_fragments
+        }
+
+        for wid in wids:
+            try:
+                geo_raw  = self._xdotool("getwindowgeometry", "--shell", str(wid))
+                cls_raw  = self._xdotool("getwindowclassname", str(wid))
+                name_raw = self._xdotool("getwindowname", str(wid))
+            except Exception:
+                continue
+
+            geo = {}
+            for line in geo_raw.splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    geo[k.strip()] = v.strip()
+
+            try:
+                x = int(geo.get("X", 0))
+                y = int(geo.get("Y", 0))
+                w = int(geo.get("WIDTH", 0))
+                h = int(geo.get("HEIGHT", 0))
+            except (ValueError, TypeError):
+                continue
+
+            if w < 200 or h < 200:   # skip tiny windows (popup tooltips etc.)
+                continue
+
+            cls   = cls_raw.lower().strip()
+            title = name_raw.strip()
+
+            is_browser = (
+                cls in all_classes or
+                any(f in cls for f in all_classes) or
+                any(f in title.lower() for f in all_title_frags)
+            )
+            if not is_browser:
+                continue
+
+            # Get PID
+            try:
+                pid_raw = self._xdotool("getwindowpid", str(wid))
+                pid = int(pid_raw) if pid_raw.isdigit() else 0
+            except Exception:
+                pid = 0
+
+            results.append(BrowserWindow(
+                wid=wid, pid=pid,
+                x=x, y=y, w=w, h=h,
+                title=title, wm_cls=cls,
+                active=(wid == active_wid),
+            ))
+
+        return results
+
+    def _fallback_fullscreen(self) -> List[BrowserWindow]:
+        """When window enumeration is unavailable, return full monitor rect."""
+        try:
+            with mss.mss() as sct:
+                monitors = sct.monitors
+                idx = min(self.config.monitor_index, len(monitors) - 1)
+                m = monitors[idx]
+                return [BrowserWindow(
+                    wid=0, pid=0,
+                    x=m.get("left", 0), y=m.get("top", 0),
+                    w=m["width"], h=m["height"],
+                    title="[full screen fallback]",
+                    wm_cls="",
+                    active=True,
+                )]
+        except Exception:
+            return []
+
+    # ── macOS ─────────────────────────────────────────────────────────────────
+
+    def _enumerate_mac(self) -> List[BrowserWindow]:
+        script = """
+        tell application "System Events"
+            set winList to {}
+            repeat with proc in (every process whose background only is false)
+                set pn to name of proc as string
+                repeat with w in windows of proc
+                    set pos to position of w
+                    set sz to size of w
+                    set winList to winList & {{pn, item 1 of pos, item 2 of pos, item 1 of sz, item 2 of sz}}
+                end repeat
+            end repeat
+            return winList
+        end tell
+        """
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=5)
+            # Parse crude output; real implementation would use Quartz APIs
+            lines = r.stdout.strip().splitlines()
+            results = []
+            for line in lines:
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 5:
+                    name = parts[0]
+                    if any(b in name.lower() for b in
+                           ["chrome", "safari", "firefox", "brave", "edge", "opera"]):
+                        try:
+                            x, y, w, h = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
+                            results.append(BrowserWindow(
+                                wid=0, pid=0, x=x, y=y, w=w, h=h,
+                                title=name, wm_cls=name.lower(), active=True,
+                            ))
+                        except (ValueError, TypeError):
+                            pass
+            return results
+        except Exception:
+            return self._fallback_fullscreen()
+
+    # ── Windows ───────────────────────────────────────────────────────────────
+
+    def _enumerate_win(self) -> List[BrowserWindow]:
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            results: List[BrowserWindow] = []
+            all_classes = BROWSER_WM_CLASSES | {
+                c.lower() for c in self.config.browser_wm_classes
+            }
+
+            EnumWindows        = ctypes.windll.user32.EnumWindows
+            GetWindowRect      = ctypes.windll.user32.GetWindowRect
+            GetWindowTextW     = ctypes.windll.user32.GetWindowTextW
+            GetClassNameW      = ctypes.windll.user32.GetClassNameW
+            IsWindowVisible    = ctypes.windll.user32.IsWindowVisible
+            GetForegroundWindow = ctypes.windll.user32.GetForegroundWindow
+            foreground_hwnd    = GetForegroundWindow()
+
+            CALLBACK = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+
+            def _cb(hwnd, _):
+                if not IsWindowVisible(hwnd):
+                    return True
+                buf   = ctypes.create_unicode_buffer(256)
+                clsbuf = ctypes.create_unicode_buffer(128)
+                GetWindowTextW(hwnd, buf, 256)
+                GetClassNameW(hwnd, clsbuf, 128)
+                title = buf.value
+                cls   = clsbuf.value.lower()
+
+                is_browser = (
+                    cls in all_classes or
+                    any(b in title.lower() for b in BROWSER_TITLE_FRAGMENTS | {
+                        f.lower() for f in self.config.browser_title_fragments
+                    })
+                )
+                if not is_browser:
+                    return True
+
+                rect = ctypes.wintypes.RECT()
+                GetWindowRect(hwnd, ctypes.byref(rect))
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+                if w < 200 or h < 200:
+                    return True
+
+                results.append(BrowserWindow(
+                    wid=hwnd, pid=0,
+                    x=rect.left, y=rect.top, w=w, h=h,
+                    title=title, wm_cls=cls,
+                    active=(hwnd == foreground_hwnd),
+                ))
+                return True
+
+            EnumWindows(CALLBACK(_cb), 0)
+            return results
+        except Exception as e:
+            log.debug(f"Win32 window enum: {e}")
+            return self._fallback_fullscreen()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MEDIA REGION CLASSIFIER
+#  Given a cropped PIL image, decides whether it looks like image/video media
+#  content (vs. UI chrome: buttons, menus, text blocks, solid fills).
+# ══════════════════════════════════════════════════════════════════════════════
+class MediaClassifier:
+    """
+    Heuristic classifier to distinguish media content from browser UI.
+
+    Rules (all must pass):
+      1. Minimum dimensions enforced by caller.
+      2. Entropy  ≥  config.entropy_min  (solid-color UI chrome is low entropy).
+      3. Color variance: image must have non-trivial saturation spread.
+      4. Not a thin horizontal strip (height > 0.15 × width) — avoids toolbars.
+      5. Not a near-square tiny region that looks like a button/icon.
+      6. Optional: aspect ratio roughly matches common image/video formats.
+    """
+
+    @staticmethod
+    def is_media(img: Image.Image, config: "Config") -> Tuple[bool, str]:
+        """Returns (is_media, reason_if_rejected)."""
+        w, h = img.size
+
+        # Size gate
+        if w < config.media_min_w or h < config.media_min_h:
+            return False, f"too_small({w}×{h})"
+
+        # Aspect ratio: reject very tall/thin slices (sidebars, scrollbars)
+        aspect = w / h
+        if aspect < 0.3:
+            return False, f"too_narrow(aspect={aspect:.2f})"
+        # Reject very short horizontal strips (toolbars, address bars)
+        if h < 40:
+            return False, "thin_strip"
+
+        # Entropy filter
+        ent = image_entropy(img)
+        if ent < config.entropy_min:
+            return False, f"low_entropy({ent:.2f})"
+
+        # Color variance (saturation spread)
+        # Convert to HSV-like and check saturation std-dev
+        try:
+            rgb = img.convert("RGB").resize((32, 32), Image.LANCZOS)
+            r_ch, g_ch, b_ch = rgb.split()
+            r_vals = list(r_ch.getdata())
+            g_vals = list(g_ch.getdata())
+            b_vals = list(b_ch.getdata())
+            n = len(r_vals)
+            sat_vals = []
+            for r, g, b in zip(r_vals, g_vals, b_vals):
+                mx = max(r, g, b)
+                mn = min(r, g, b)
+                sat_vals.append((mx - mn) / (mx + 1))
+            sat_mean = sum(sat_vals) / n
+            sat_var  = sum((v - sat_mean) ** 2 for v in sat_vals) / n
+            sat_std  = sat_var ** 0.5
+            # UI chrome (gray menus, white forms) has very low saturation std
+            if sat_std < 0.04 and ent < 5.5:
+                return False, f"flat_palette(sat_std={sat_std:.3f})"
+        except Exception:
+            pass   # if colour analysis fails, allow through
+
+        return True, "ok"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCREEN MONITOR  — Browser-aware, event-driven
 # ══════════════════════════════════════════════════════════════════════════════
 class ScreenMonitor(QObject):
     detection = pyqtSignal(float, int, int, int, int, str, float, float)
     # score, x, y, w, h, ts_str, entropy, latency_ms
 
+    # Emitted when browser presence changes so the tray can update status
+    browser_state_changed = pyqtSignal(bool, str)   # active, window_title
+
     def __init__(self, config: Config):
         super().__init__()
         self.config          = config
-        self._last_img       = None
+        self._tracker        = BrowserWindowTracker(config)
+        self._classifier     = MediaClassifier()
+        self._last_frames: Dict[int, Image.Image] = {}   # wid → last frame
         self._dedup: Dict[str, float] = {}
         self._bloom          = BloomFilter()
         self._worker_q: List[APIWorker] = []
         self._active_workers = 0
         self._api_count      = 0
         self._error_count    = 0
-        self._last_activity  = time.time()
         self._is_paused      = False
         self._session_start  = time.time()
+        self._browser_active = False
+        self._active_title   = ""
 
-        self._motion_timer = QTimer()
-        self._motion_timer.timeout.connect(self._tick)
-        self._motion_timer.start(MOTION_DEBOUNCE)
+        # ── Window poll timer (checks which browser windows are open) ─────────
+        self._window_timer = QTimer()
+        self._window_timer.timeout.connect(self._poll_windows)
+        self._window_timer.start(WINDOW_POLL_MS)
 
-        self._interval_timer = QTimer()
-        self._interval_timer.timeout.connect(self._scheduled_scan)
-        self._interval_timer.start(config.interval_ms)
+        # ── Frame grab timer (runs fast, only does work when browser active) ──
+        self._frame_timer = QTimer()
+        self._frame_timer.timeout.connect(self._tick)
+        self._frame_timer.start(FRAME_POLL_MS)
 
+        # ── Static re-scan timer (catches images that stopped moving) ─────────
+        self._static_timer = QTimer()
+        self._static_timer.timeout.connect(self._static_rescan)
+        self._static_timer.start(config.static_rescan_ms)
+
+        # ── Housekeeping ──────────────────────────────────────────────────────
         self._cleanup_timer = QTimer()
         self._cleanup_timer.timeout.connect(self._cleanup_dedup)
         self._cleanup_timer.start(30_000)
@@ -1493,8 +1916,12 @@ class ScreenMonitor(QObject):
         self._heatmap_decay_timer.timeout.connect(self._do_heatmap_decay)
         self._heatmap_decay_timer.start(5000)
 
-        # Heatmap initialized lazily on first frame
         self._heatmap: Optional[DetectionHeatmap] = None
+
+        # Seed first window poll immediately
+        self._poll_windows()
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     @property
     def api_count(self):   return self._api_count
@@ -1502,135 +1929,276 @@ class ScreenMonitor(QObject):
     def error_count(self): return self._error_count
     @property
     def uptime_s(self):    return time.time() - self._session_start
+    @property
+    def browser_active(self): return self._browser_active
+    @property
+    def active_browser_title(self): return self._active_title
 
     def pause(self):
         self._is_paused = True
-        self._last_img  = None
+        self._last_frames.clear()
 
     def resume(self):
         self._is_paused = False
-        self._last_activity = time.time()
 
-    def _is_excluded(self, x: int, y: int, w: int, h: int) -> bool:
-        """Check if region overlaps any exclusion zone."""
-        for zone in self.config.exclusion_zones:
-            zx, zy, zw, zh = zone[:4]
-            if (x < zx + zw and x + w > zx and
-                    y < zy + zh and y + h > zy):
-                return True
-        return False
+    def shutdown(self):
+        for t in [self._window_timer, self._frame_timer, self._static_timer,
+                  self._cleanup_timer, self._heatmap_decay_timer]:
+            t.stop()
+        for w in list(self._worker_q):
+            w.quit()
+            w.wait(2000)
 
-    def _tick(self):
-        """Motion-based trigger: fires when screen changes."""
+    # ── Window polling ────────────────────────────────────────────────────────
+
+    def _poll_windows(self):
+        """Refresh the browser window list. Runs at WINDOW_POLL_MS."""
         if self._is_paused:
             return
-        idle = self.config.auto_pause_idle_s
-        if idle > 0 and time.time() - self._last_activity > idle:
+        windows = self._tracker.refresh()
+
+        # Determine if any browser is active / visible
+        if self.config.browser_only_mode:
+            if self.config.scan_all_visible:
+                active = len(windows) > 0
+                title  = windows[0].title if windows else ""
+            else:
+                fw = self._tracker.foreground()
+                active = fw is not None
+                title  = fw.title if fw else ""
+        else:
+            # Non-browser-only: treat whole screen as target
+            active = True
+            title  = "[all screens]"
+
+        changed = (active != self._browser_active) or (title != self._active_title)
+        self._browser_active = active
+        self._active_title   = title
+
+        if changed:
+            state_str = f"{'ACTIVE' if active else 'IDLE'}  {title[:60]}"
+            log.info(f"Browser state: {state_str}")
+            self.browser_state_changed.emit(active, title)
+
+        # Evict last_frames for windows that closed
+        active_wids = {w.wid for w in windows}
+        stale = [wid for wid in self._last_frames if wid not in active_wids]
+        for wid in stale:
+            del self._last_frames[wid]
+
+    # ── Frame grab (motion-based trigger) ─────────────────────────────────────
+
+    def _tick(self):
+        """
+        Runs at FRAME_POLL_MS (120ms by default).  Only does real work when
+        a browser window is the active / visible target.  For each target window,
+        grabs a screenshot, diffs against the previous frame, and submits any
+        sufficiently-changed media-like region for AI analysis.
+        """
+        if self._is_paused:
             return
+
+        if not self._browser_active and self.config.browser_only_mode:
+            return
+
+        targets = self._get_target_windows()
+        if not targets:
+            return
+
+        for win in targets:
+            self._process_window_frame(win)
+
+    def _get_target_windows(self) -> List[BrowserWindow]:
+        """Returns the windows we should be scanning this tick."""
+        if not self.config.browser_only_mode:
+            # Synthesize a fake window covering the configured monitor
+            try:
+                with mss.mss() as sct:
+                    monitors = sct.monitors
+                    idx = min(self.config.monitor_index, len(monitors) - 1)
+                    m = monitors[idx]
+                    return [BrowserWindow(
+                        wid=0, pid=0,
+                        x=m.get("left", 0), y=m.get("top", 0),
+                        w=m["width"], h=m["height"],
+                        title="[full screen]", wm_cls="", active=True,
+                    )]
+            except Exception:
+                return []
+
+        cached = self._tracker.cached()
+        if self.config.scan_all_visible:
+            return [w for w in cached if w.w > 0 and w.h > 0]
+        else:
+            fw = self._tracker.foreground()
+            return [fw] if fw else []
+
+    def _grab_window(self, win: BrowserWindow) -> Optional[Image.Image]:
+        """Grab a screenshot of the given window geometry."""
         try:
             with mss.mss() as sct:
-                monitors = sct.monitors
-                idx      = min(self.config.monitor_index, len(monitors) - 1)
-                mon      = monitors[idx]
-                raw      = sct.grab(mon)
-                img      = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+                region = {
+                    "left":   win.x,
+                    "top":    win.y,
+                    "width":  win.w,
+                    "height": win.h,
+                }
+                raw = sct.grab(region)
+                return Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+        except Exception as e:
+            log.debug(f"grab_window({win.wid}): {e}")
+            return None
 
-            if self._heatmap is None:
-                self._heatmap = DetectionHeatmap(img.width, img.height)
-
-            if self._last_img is None:
-                self._last_img = img
-                return
-
-            diff = ImageChops.difference(img, self._last_img)
-            bbox = diff.getbbox()
-            self._last_img = img
-
-            if not bbox:
-                return
-            bw = bbox[2] - bbox[0]
-            bh = bbox[3] - bbox[1]
-            if bw < self.config.motion_min_px or bh < self.config.motion_min_px:
-                return
-
-            cropped = img.crop(bbox)
-            self._analyze_region(img, cropped, bbox, mon)
-
-        except Exception:
-            log.debug(traceback.format_exc())
-
-    def _scheduled_scan(self):
-        """Interval-based full-frame re-scan (catches static AI content)."""
-        if self._is_paused or self._last_img is None:
-            return
-        try:
-            with mss.mss() as sct:
-                monitors = sct.monitors
-                idx      = min(self.config.monitor_index, len(monitors) - 1)
-                mon      = monitors[idx]
-                raw      = sct.grab(mon)
-                img      = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-
-            # Scan the full screen as a region
-            bbox     = (0, 0, img.width, img.height)
-            cropped  = img
-            self._analyze_region(img, cropped, bbox, mon)
-        except Exception:
-            log.debug(traceback.format_exc())
-
-    def _analyze_region(self, full_img: Image.Image, cropped: Image.Image,
-                        bbox: tuple, mon: dict):
-        ph  = phash(cropped)
-        ah  = ahash(cropped)
-        ent = image_entropy(cropped) if self.config.entropy_filter else 0.0
-
-        # Entropy filter: skip flat/boring regions
-        if self.config.entropy_filter and ent < self.config.entropy_min:
+    def _process_window_frame(self, win: BrowserWindow):
+        """Diff current frame against previous; submit changed media regions."""
+        img = self._grab_window(win)
+        if img is None:
             return
 
-        # Exclusion zone check
+        if self._heatmap is None:
+            self._heatmap = DetectionHeatmap(img.width, img.height)
+
+        prev = self._last_frames.get(win.wid)
+        self._last_frames[win.wid] = img
+
+        if prev is None or prev.size != img.size:
+            return   # first frame for this window — baseline only
+
+        # Compute per-pixel diff
+        diff = ImageChops.difference(img, prev)
+        bbox = diff.getbbox()
+        if bbox is None:
+            return   # no change
+
         bx, by = bbox[0], bbox[1]
         bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        if self._is_excluded(bx, by, bw, bh):
+
+        # Motion region must be large enough to be media
+        if bw < self.config.motion_min_px or bh < self.config.motion_min_px:
             return
 
-        # Bloom pre-screen
-        if ph in self._bloom:
-            # Precise dedup check
-            if self.config.dedup_enabled:
-                if ph in self._dedup and self._dedup[ph] > time.time():
-                    return
+        # Expand the bounding box slightly to capture full element context
+        pad = 12
+        ex  = max(0, bx - pad)
+        ey  = max(0, by - pad)
+        ex2 = min(img.width,  bx + bw + pad)
+        ey2 = min(img.height, by + bh + pad)
+        cropped = img.crop((ex, ey, ex2, ey2))
+
+        abs_x = win.x + ex
+        abs_y = win.y + ey
+        abs_w = ex2 - ex
+        abs_h = ey2 - ey
+
+        self._submit_region(img, cropped, abs_x, abs_y, abs_w, abs_h, win)
+
+    # ── Static re-scan ────────────────────────────────────────────────────────
+
+    def _static_rescan(self):
+        """
+        Re-analyses the current content of each browser window even if nothing
+        moved.  This catches images that loaded and then became static (i.e.
+        the user is looking at a page with AI-generated art but stopped scrolling).
+
+        We don't send the whole window — instead we tile it into a grid of
+        candidate regions and filter each through MediaClassifier before
+        dispatching.  This keeps API usage sane.
+        """
+        if self._is_paused or not self._browser_active:
+            return
+
+        targets = self._get_target_windows()
+        for win in targets:
+            img = self._grab_window(win)
+            if img is None:
+                continue
+
+            iw, ih = img.size
+            # Use a fairly coarse tile grid — 2 columns × 3 rows max
+            tile_cols = min(2, max(1, iw // 600))
+            tile_rows = min(3, max(1, ih // 400))
+            tw = iw // tile_cols
+            th = ih // tile_rows
+
+            for row in range(tile_rows):
+                for col in range(tile_cols):
+                    tx  = col * tw
+                    ty  = row * th
+                    tx2 = min(iw, tx + tw)
+                    ty2 = min(ih, ty + th)
+                    tile = img.crop((tx, ty, tx2, ty2))
+
+                    abs_x = win.x + tx
+                    abs_y = win.y + ty
+
+                    self._submit_region(
+                        img, tile,
+                        abs_x, abs_y, tx2 - tx, ty2 - ty,
+                        win,
+                    )
+
+    # ── Region submission pipeline ────────────────────────────────────────────
+
+    def _submit_region(self, full_img: Image.Image, cropped: Image.Image,
+                       abs_x: int, abs_y: int, abs_w: int, abs_h: int,
+                       win: BrowserWindow):
+        """
+        Runs the full pre-flight pipeline on a candidate region:
+          MediaClassifier → exclusion zone → dedup → dispatch.
+        """
+        # 1. Media content classifier (size, entropy, saturation, aspect)
+        ok, reason = MediaClassifier.is_media(cropped, self.config)
+        if not ok:
+            log.debug(f"region rejected: {reason}  ({abs_w}×{abs_h})")
+            return
+
+        # 2. Exclusion zone
+        if self._is_excluded(abs_x, abs_y, abs_w, abs_h):
+            return
+
+        # 3. Deduplication
+        ph  = phash(cropped)
+        ent = image_entropy(cropped)
+
+        if ph in self._bloom and self.config.dedup_enabled:
+            if ph in self._dedup and self._dedup[ph] > time.time():
+                return
 
         self._bloom.add(ph)
         self._dedup[ph] = time.time() + DEDUP_TTL
-        self._last_activity = time.time()
 
-        # Build burst frames
+        # 4. Build burst frames (slightly jittered crops for multi-frame blending)
         frames = []
         buf = io.BytesIO()
         cropped.save(buf, format="JPEG", quality=90)
         frames.append(buf.getvalue())
 
         for i in range(1, self.config.burst_frames):
-            pad = 5 * i
-            jx  = max(0, bbox[0] - pad)
-            jy  = max(0, bbox[1] - pad)
-            jx2 = min(full_img.width,  bbox[2] + pad)
-            jy2 = min(full_img.height, bbox[3] + pad)
-            ex  = full_img.crop((jx, jy, jx2, jy2))
+            pad = 6 * i
+            fx  = max(0, abs_x - win.x - pad)
+            fy  = max(0, abs_y - win.y - pad)
+            fx2 = min(full_img.width,  abs_x - win.x + abs_w + pad)
+            fy2 = min(full_img.height, abs_y - win.y + abs_h + pad)
+            ex  = full_img.crop((fx, fy, fx2, fy2))
             b2  = io.BytesIO()
             ex.save(b2, format="JPEG", quality=90)
             frames.append(b2.getvalue())
 
-        mon_l = mon.get("left", 0)
-        mon_t = mon.get("top",  0)
-        coords = [mon_l + bx, mon_t + by, bw, bh]
-        self._dispatch(frames, coords, ph, ent, cropped)
+        coords = [abs_x, abs_y, abs_w, abs_h]
+        self._dispatch(frames, coords, ph, ent, win)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _is_excluded(self, x: int, y: int, w: int, h: int) -> bool:
+        for zone in self.config.exclusion_zones:
+            zx, zy, zw, zh = zone[:4]
+            if x < zx + zw and x + w > zx and y < zy + zh and y + h > zy:
+                return True
+        return False
 
     def _dispatch(self, frames: List[bytes], coords: list, ph: str,
-                  entropy: float, region_img: Image.Image):
-        max_w = self.config.max_workers
-        if self._active_workers >= max_w:
+                  entropy: float, win: BrowserWindow):
+        if self._active_workers >= self.config.max_workers:
             return
 
         worker = APIWorker(frames, coords, ph, entropy, self.config)
@@ -1655,14 +2223,14 @@ class ScreenMonitor(QObject):
         if score >= self.config.threshold:
             ts = datetime.datetime.now().isoformat(timespec="seconds")
             self.detection.emit(score, *coords, ts, entropy, latency)
-            # Heatmap
             if self._heatmap:
                 self._heatmap.record(*coords, score)
 
     def _on_error(self, msg: str, ph: str):
         log.warning(f"API [{ph[:8]}]: {msg}")
         self._error_count += 1
-        self._dedup.pop(ph, None)
+        if msg != "NO_CREDENTIALS":
+            self._dedup.pop(ph, None)
 
     def _cleanup_dedup(self):
         now = time.time()
@@ -1671,15 +2239,6 @@ class ScreenMonitor(QObject):
     def _do_heatmap_decay(self):
         if self._heatmap:
             self._heatmap.decay()
-
-    def shutdown(self):
-        self._motion_timer.stop()
-        self._interval_timer.stop()
-        self._cleanup_timer.stop()
-        self._heatmap_decay_timer.stop()
-        for w in list(self._worker_q):
-            w.quit()
-            w.wait(2000)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIG DIALOG  — Full enterprise configuration panel
@@ -1694,6 +2253,7 @@ class ConfigDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.addTab(self._tab_api(),      "🔑  API & Keys")
+        tabs.addTab(self._tab_browser(),  "🌐  Browser Targets")
         tabs.addTab(self._tab_detect(),   "🔍  Detection")
         tabs.addTab(self._tab_badge(),    "🎨  Badge")
         tabs.addTab(self._tab_alerts(),   "🔔  Alerts")
@@ -1775,12 +2335,6 @@ class ConfigDialog(QDialog):
         sec_row.addWidget(show_btn)
         sec_w = QWidget(); sec_w.setLayout(sec_row)
 
-        self._intv = self._combo(
-            [("Ultra Fast (1s)",1000),("Fast (2s)",2000),
-             ("Balanced (4s)",4000),("Economy (8s)",8000),
-             ("Slow (15s)",15000)],
-            self.config.interval_ms
-        )
         self._blend = self._combo(
             [("Average", "average"), ("Maximum", "maximum"),
              ("Weighted Average", "weighted_avg"),
@@ -1791,17 +2345,161 @@ class ConfigDialog(QDialog):
         self._retry   = self._spin(self.config.retry_max, 1, 10)
         self._backoff = self._spin(self.config.retry_backoff_ms, 100, 5000, " ms")
 
-        note = self._lbl("🔐 API secret is encrypted at rest using machine-derived key.\n"
-                         "Get free keys at sightengine.com/signup  (500 free calls/month)")
+        note = self._lbl(
+            "🔐 API secret is AES-256 encrypted at rest using a machine-derived key.\n"
+            "Get free keys at sightengine.com/signup  (500 free calls/month)\n"
+            "Detection fires only when browser/image content is detected — not on a fixed poll interval."
+        )
         f.addRow("API User:", self._user)
         f.addRow("API Secret:", sec_w)
-        f.addRow("Poll Interval:", self._intv)
         f.addRow("Score Blend:", self._blend)
         f.addRow("Max API Workers:", self._max_workers)
         f.addRow("Retry Attempts:", self._retry)
         f.addRow("Retry Backoff:", self._backoff)
         f.addRow("", note)
         return sa
+
+    # ── Tab: Browser Targets ─────────────────────────────────────────────────
+    def _tab_browser(self):
+        sa, w, f = self._fw()
+
+        self._browser_only = QCheckBox(
+            "Browser-only mode  (only scan when a browser or PWA is the active window)"
+        )
+        self._browser_only.setChecked(self.config.browser_only_mode)
+
+        self._scan_all_visible = QCheckBox(
+            "Scan all visible browser windows  (not just foreground)"
+        )
+        self._scan_all_visible.setChecked(self.config.scan_all_visible)
+
+        # Built-in browser list (read-only display)
+        builtin_lbl = QLabel(
+            "  " + " · ".join(sorted(BROWSER_WM_CLASSES))
+        )
+        builtin_lbl.setStyleSheet(f"color:{C['sub']}; font-size:10px;")
+        builtin_lbl.setWordWrap(True)
+
+        # Custom WM_CLASS list
+        self._custom_cls_list = QListWidget()
+        self._custom_cls_list.setMaximumHeight(110)
+        for cls in self.config.browser_wm_classes:
+            self._custom_cls_list.addItem(cls)
+
+        self._new_cls_edit = QLineEdit()
+        self._new_cls_edit.setPlaceholderText("e.g.  myapp  or  electron")
+        add_cls_btn = QPushButton("+ Add")
+        add_cls_btn.setStyleSheet(mk_btn(C["ok_d"], small=True))
+        add_cls_btn.clicked.connect(self._add_browser_cls)
+        del_cls_btn = QPushButton("− Remove")
+        del_cls_btn.setStyleSheet(mk_btn(C["danger_d"], small=True))
+        del_cls_btn.clicked.connect(lambda: self._del_list_item(self._custom_cls_list))
+        cls_btn_row = QHBoxLayout()
+        cls_btn_row.addWidget(self._new_cls_edit, 1)
+        cls_btn_row.addWidget(add_cls_btn)
+        cls_btn_row.addWidget(del_cls_btn)
+        cls_btn_w = QWidget(); cls_btn_w.setLayout(cls_btn_row)
+
+        # Custom title fragment list
+        self._custom_title_list = QListWidget()
+        self._custom_title_list.setMaximumHeight(90)
+        for frag in self.config.browser_title_fragments:
+            self._custom_title_list.addItem(frag)
+
+        self._new_title_edit = QLineEdit()
+        self._new_title_edit.setPlaceholderText("e.g.  – My PWA App")
+        add_title_btn = QPushButton("+ Add")
+        add_title_btn.setStyleSheet(mk_btn(C["ok_d"], small=True))
+        add_title_btn.clicked.connect(self._add_browser_title)
+        del_title_btn = QPushButton("− Remove")
+        del_title_btn.setStyleSheet(mk_btn(C["danger_d"], small=True))
+        del_title_btn.clicked.connect(lambda: self._del_list_item(self._custom_title_list))
+        title_btn_row = QHBoxLayout()
+        title_btn_row.addWidget(self._new_title_edit, 1)
+        title_btn_row.addWidget(add_title_btn)
+        title_btn_row.addWidget(del_title_btn)
+        title_btn_w = QWidget(); title_btn_w.setLayout(title_btn_row)
+
+        # Live detection probe button
+        probe_btn = QPushButton("🔍  Detect Browser Windows Now")
+        probe_btn.setStyleSheet(mk_btn(C["accent_d"], small=True))
+        probe_btn.clicked.connect(self._probe_browser_windows)
+        self._probe_out = QTextEdit()
+        self._probe_out.setReadOnly(True)
+        self._probe_out.setMaximumHeight(120)
+        self._probe_out.setFont(QFont("JetBrains Mono", 9))
+        self._probe_out.setPlaceholderText("Click above to scan open windows…")
+
+        f.addRow("", self._browser_only)
+        f.addRow("", self._scan_all_visible)
+        f.addRow("", self._lbl(
+            "When enabled, the watcher sleeps completely when a browser is not the foreground "
+            "window — zero CPU and zero API calls. Disable to monitor any screen content."
+        ))
+        f.addRow("Built-in targets:", builtin_lbl)
+        f.addRow("Custom WM_CLASS:", self._custom_cls_list)
+        f.addRow("", cls_btn_w)
+        f.addRow("", self._lbl(
+            "Add the WM_CLASS of any PWA or Electron app you want to monitor.\n"
+            "Find it with:  xprop WM_CLASS  (click the window)"
+        ))
+        f.addRow("Custom title fragments:", self._custom_title_list)
+        f.addRow("", title_btn_w)
+        f.addRow("", self._lbl(
+            "Title substring to match (case-insensitive). Useful for PWAs that don't "
+            "have a standard WM_CLASS."
+        ))
+        f.addRow("", probe_btn)
+        f.addRow("Window scan results:", self._probe_out)
+        return sa
+
+    def _add_browser_cls(self):
+        val = self._new_cls_edit.text().strip()
+        if val:
+            self._custom_cls_list.addItem(val)
+            self._new_cls_edit.clear()
+
+    def _add_browser_title(self):
+        val = self._new_title_edit.text().strip()
+        if val:
+            self._custom_title_list.addItem(val)
+            self._new_title_edit.clear()
+
+    def _del_list_item(self, lst: QListWidget):
+        for item in lst.selectedItems():
+            lst.takeItem(lst.row(item))
+
+    def _probe_browser_windows(self):
+        """Run a live window scan and show results in the text box."""
+        # Build a temporary tracker with current (unsaved) custom lists
+        tmp_cfg = copy.deepcopy(self.config)
+        tmp_cfg.browser_wm_classes = [
+            self._custom_cls_list.item(i).text()
+            for i in range(self._custom_cls_list.count())
+        ]
+        tmp_cfg.browser_title_fragments = [
+            self._custom_title_list.item(i).text()
+            for i in range(self._custom_title_list.count())
+        ]
+        tmp_cfg.browser_only_mode = True
+        tracker = BrowserWindowTracker(tmp_cfg)
+        windows = tracker.refresh()
+
+        if not windows:
+            self._probe_out.setPlainText(
+                "No browser windows detected.\n"
+                "Make sure a supported browser is open, or add a custom WM_CLASS above."
+            )
+            return
+
+        lines = []
+        for win in windows:
+            active_tag = "[ACTIVE] " if win.active else "         "
+            cls_part   = (win.wm_cls or "?")[:30].ljust(30)
+            geo_part   = f"{win.w}x{win.h} @({win.x},{win.y})"
+            title_part = win.title[:50]
+            lines.append(f"{active_tag}{cls_part}  {geo_part}  \"{title_part}\"")
+        self._probe_out.setPlainText("\n".join(lines))
 
     # ── Tab: Detection ───────────────────────────────────────────────────────
     def _tab_detect(self):
@@ -1818,39 +2516,60 @@ class ConfigDialog(QDialog):
             self._mon.addItem("Monitor 1", 0)
         self._mon.setCurrentIndex(min(self.config.monitor_index, self._mon.count() - 1))
 
-        # Threshold slider + label
+        # Threshold slider
         self._thresh_sl = QSlider(Qt.Horizontal)
         self._thresh_sl.setRange(50, 99)
         self._thresh_sl.setValue(int(self.config.threshold * 100))
         self._thresh_lbl = QLabel(f"{int(self.config.threshold * 100)}%")
         self._thresh_lbl.setStyleSheet(f"color: {C['accent']}; font-weight: bold; min-width: 38px;")
-        self._thresh_sl.valueChanged.connect(
-            lambda v: self._thresh_lbl.setText(f"{v}%"))
+        self._thresh_sl.valueChanged.connect(lambda v: self._thresh_lbl.setText(f"{v}%"))
         thresh_row = QHBoxLayout()
         thresh_row.addWidget(self._thresh_sl, 1)
         thresh_row.addWidget(self._thresh_lbl)
         thresh_w = QWidget(); thresh_w.setLayout(thresh_row)
 
+        # Media minimum size
+        self._media_min_w = self._spin(self.config.media_min_w, 40, 2000, " px")
+        self._media_min_h = self._spin(self.config.media_min_h, 30, 2000, " px")
+        media_sz_row = QHBoxLayout()
+        media_sz_row.addWidget(QLabel("W:")); media_sz_row.addWidget(self._media_min_w)
+        media_sz_row.addSpacing(12)
+        media_sz_row.addWidget(QLabel("H:")); media_sz_row.addWidget(self._media_min_h)
+        media_sz_row.addStretch()
+        media_sz_w = QWidget(); media_sz_w.setLayout(media_sz_row)
+
         self._motion   = self._spin(self.config.motion_min_px, 40, 4000, " px")
         self._burst    = self._spin(self.config.burst_frames, 1, 8, " frames")
         self._bgap     = self._spin(self.config.burst_gap_ms, 50, 2000, " ms")
+        self._static_rescan = self._spin(self.config.static_rescan_ms // 1000, 2, 120, " s")
+
+        self._media_aspect = QCheckBox("Require media-like aspect ratio (filters out UI chrome strips)")
+        self._media_aspect.setChecked(self.config.media_require_aspect)
+
         self._dedup    = QCheckBox("Enable perceptual hash deduplication")
         self._dedup.setChecked(self.config.dedup_enabled)
         self._ham_tol  = self._spin(self.config.dedup_hamming_tolerance, 0, 16, " bits")
-        self._ent_ck   = QCheckBox("Enable entropy pre-filter (skip low-complexity regions)")
+        self._ent_ck   = QCheckBox("Enable entropy pre-filter (recommended — skips UI chrome)")
         self._ent_ck.setChecked(self.config.entropy_filter)
         self._ent_min  = self._spin(self.config.entropy_min, 1.0, 8.0, "", dbl=True)
 
         f.addRow("Monitor:", self._mon)
         f.addRow("AI Threshold:", thresh_w)
+        f.addRow("", self._lbl("Minimum score to flag content as AI-generated."))
+        f.addRow("Min Media Size:", media_sz_w)
+        f.addRow("", self._lbl("Regions smaller than this are ignored (skips icons, buttons, favicons)."))
+        f.addRow("", self._media_aspect)
         f.addRow("Min Motion Region:", self._motion)
+        f.addRow("", self._lbl("Minimum changed pixel area to trigger analysis on motion."))
         f.addRow("Burst Frames:", self._burst)
         f.addRow("Burst Gap:", self._bgap)
+        f.addRow("Static Re-scan:", self._static_rescan)
+        f.addRow("", self._lbl("How often to re-check static content that stopped moving."))
         f.addRow("", self._dedup)
         f.addRow("Hash Tolerance:", self._ham_tol)
         f.addRow("", self._ent_ck)
         f.addRow("Min Entropy:", self._ent_min)
-        f.addRow("", self._lbl("Higher entropy → more complex images. Typical photos: 6-8, AI art: 5-7, solid fills: <3"))
+        f.addRow("", self._lbl("Higher entropy → more complex images. Photos: 6-8  |  AI art: 5-7  |  Solid fills / UI: <3"))
         return sa
 
     # ── Tab: Badge ───────────────────────────────────────────────────────────
@@ -2058,20 +2777,36 @@ class ConfigDialog(QDialog):
         c = self.config
         c.api_user              = self._user.text().strip()
         c.api_secret            = self._secret.text().strip()
-        c.interval_ms           = self._intv.currentData()
         c.score_blend           = self._blend.currentData()
         c.max_workers           = self._max_workers.value()
         c.retry_max             = self._retry.value()
         c.retry_backoff_ms      = self._backoff.value()
+        # Browser targeting
+        c.browser_only_mode     = self._browser_only.isChecked()
+        c.scan_all_visible      = self._scan_all_visible.isChecked()
+        c.browser_wm_classes    = [
+            self._custom_cls_list.item(i).text()
+            for i in range(self._custom_cls_list.count())
+        ]
+        c.browser_title_fragments = [
+            self._custom_title_list.item(i).text()
+            for i in range(self._custom_title_list.count())
+        ]
+        # Detection
         c.threshold             = self._thresh_sl.value() / 100.0
         c.monitor_index         = self._mon.currentData()
+        c.media_min_w           = self._media_min_w.value()
+        c.media_min_h           = self._media_min_h.value()
+        c.media_require_aspect  = self._media_aspect.isChecked()
         c.motion_min_px         = self._motion.value()
         c.burst_frames          = self._burst.value()
         c.burst_gap_ms          = self._bgap.value()
+        c.static_rescan_ms      = self._static_rescan.value() * 1000
         c.dedup_enabled         = self._dedup.isChecked()
         c.dedup_hamming_tolerance = self._ham_tol.value()
         c.entropy_filter        = self._ent_ck.isChecked()
         c.entropy_min           = float(self._ent_min.value())
+        # Badge
         c.badge_style           = self._bstyle.currentData()
         c.badge_size            = self._bsz_sl.value()
         c.badge_opacity         = self._bop_sl.value() / 100.0
@@ -2079,15 +2814,18 @@ class ConfigDialog(QDialog):
         c.badge_fade_ms         = self._fade.value()
         c.badge_pulse           = self._pulse.isChecked()
         c.badge_sound           = self._bsound.isChecked()
+        # Alerts
         c.desktop_notify        = self._notify.isChecked()
         c.webhook_enabled       = self._wh_en.isChecked()
         c.webhook_url           = self._wh_url.text().strip()
         c.webhook_type          = self._wh_type.currentData()
         c.webhook_threshold     = self._wh_thresh_sl.value() / 100.0
+        # Archive
         c.snapshot_enabled      = self._snap_en.isChecked()
         c.snapshot_retention    = self._snap_ret.value()
         c.log_enabled           = self._log_en.isChecked()
         c.max_log               = self._max_log.value()
+        # System
         c.auto_pause_idle_s     = self._idle.value()
 
         # Exclusion zones
@@ -2284,6 +3022,7 @@ class StatsDashboard(QDialog):
             ("api",     "API CALLS",    C["purple"]),
             ("errors",  "ERRORS",       C["sub"]),
             ("uptime",  "UPTIME",       C["teal"]),
+            ("browser", "BROWSER",      C["ok"]),
         ]
         for key, lbl, col in card_defs:
             card = QFrame()
@@ -2469,6 +3208,18 @@ class StatsDashboard(QDialog):
         self._cards["errors"].setText(str(self.monitor.error_count))
         self._cards["uptime"].setText(f"{hh}h{mm:02d}m")
 
+        # Browser status card
+        if self.monitor.browser_active:
+            self._cards["browser"].setText("ACTIVE")
+            self._cards["browser"].setStyleSheet(f"color:{C['ok']}; font-size:14px; font-weight:bold;")
+            self._status_led.setText("● ACTIVE")
+            self._status_led.setStyleSheet(f"color:{C['ok']}; font-size:11px; font-weight:bold;")
+        else:
+            self._cards["browser"].setText("IDLE")
+            self._cards["browser"].setStyleSheet(f"color:{C['sub']}; font-size:14px; font-weight:bold;")
+            self._status_led.setText("○ IDLE")
+            self._status_led.setStyleSheet(f"color:{C['sub']}; font-size:11px; font-weight:bold;")
+
         # Table
         ai_only = self._ai_only_ck.isChecked()
         entries = self.db.entries(limit=500, ai_only=ai_only)
@@ -2570,13 +3321,29 @@ class Sentinel(QObject):
         self._det_count_session = 0
 
         self.monitor.detection.connect(self._on_detection)
+        self.monitor.browser_state_changed.connect(self._on_browser_state)
 
         self._setup_tray()
-        log.info(f"{APP_NAME} v{APP_VERSION} started  |  threshold={int(self.config.threshold*100)}%  "
-                 f"blend={self.config.score_blend}  style={self.config.badge_style}")
+        browser_mode = "browser-only" if self.config.browser_only_mode else "all-screen"
+        log.info(
+            f"{APP_NAME} v{APP_VERSION} started  |  threshold={int(self.config.threshold*100)}%  "
+            f"blend={self.config.score_blend}  style={self.config.badge_style}  "
+            f"mode={browser_mode}"
+        )
 
         if self.config.autostart and sys.platform.startswith("linux"):
             Autostart.install()
+
+        # First-run / missing-credentials wizard — open config automatically
+        if not str(self.config.api_user).strip() or not str(self.config.api_secret).strip():
+            log.info("No API credentials found — opening configuration dialog.")
+            self.tray.showMessage(
+                f"{APP_NAME} — Setup Required",
+                "Welcome! Enter your Sightengine API User and Secret to start monitoring.\n"
+                "Get free keys at: sightengine.com/signup",
+                QSystemTrayIcon.Information, 8000,
+            )
+            QTimer.singleShot(600, self._open_config)
 
     # ── Tray icon ─────────────────────────────────────────────────────────────
     def _make_icon(self, state: str = "on") -> QIcon:
@@ -2684,16 +3451,22 @@ class Sentinel(QObject):
 
     def _update_tray(self):
         s     = self.db.stats()
-        state = "paused" if self._paused else "on"
+        state = "paused" if self._paused else ("off" if not self.monitor.browser_active else "on")
         self.tray.setIcon(self._make_icon(state))
         errs  = self.monitor.error_count
         up    = int(self.monitor.uptime_s)
         hh, mm = divmod(up // 60, 60)
+        browser_line = (
+            f"Browser: {self.monitor.active_browser_title[:40]}"
+            if self.monitor.browser_active
+            else "Browser: idle / not detected"
+        )
         self.tray.setToolTip(
             f"{APP_NAME}  {'[PAUSED]' if self._paused else '[ACTIVE]'}\n"
+            f"{browser_line}\n"
             f"Today: {s['today']} AI  |  24h: {s['h24']} AI\n"
             f"API calls: {self.monitor.api_count}  |  Errors: {errs}\n"
-            f"Session detections: {self._det_count_session}  |  Uptime: {hh}h{mm:02d}m"
+            f"Session: {self._det_count_session}  |  Uptime: {hh}h{mm:02d}m"
         )
 
     # ── Detection ─────────────────────────────────────────────────────────────
@@ -2759,12 +3532,31 @@ class Sentinel(QObject):
             self.tray.setIcon(self._make_icon("on"))
             log.info("Monitoring resumed.")
 
+    def _on_browser_state(self, active: bool, title: str):
+        """Update tray tooltip and icon when browser presence changes."""
+        if not active and self.config.browser_only_mode and not self._paused:
+            self.tray.setIcon(self._make_icon("off"))
+            self.tray.setToolTip(
+                f"{APP_NAME}  [IDLE — no browser]\n"
+                "Monitoring will resume when a browser window becomes active."
+            )
+        elif not self._paused:
+            self.tray.setIcon(self._make_icon("on"))
+            short_title = title[:55] + "…" if len(title) > 55 else title
+            self.tray.setToolTip(
+                f"{APP_NAME}  [ACTIVE]\n"
+                f"Watching: {short_title}"
+            )
+
     def _open_config(self):
         dlg = ConfigDialog(self.config)
         if dlg.exec_():
-            # Apply live config changes
-            self.monitor._motion_timer.setInterval(MOTION_DEBOUNCE)
-            self.monitor._interval_timer.setInterval(self.config.interval_ms)
+            # Re-apply timer intervals from new config
+            self.monitor._static_timer.setInterval(self.config.static_rescan_ms)
+            self.monitor._window_timer.setInterval(WINDOW_POLL_MS)
+            # Re-seed tracker with updated custom browser lists
+            self.monitor._tracker = BrowserWindowTracker(self.config)
+            self.monitor._poll_windows()
             log.info("Configuration updated and applied.")
 
     def _open_dashboard(self):
