@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "ai-sentinel"
+version = "2.0.0"
+description = "Enterprise background AI content detector with zero-UI floating badge overlay"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "tsann", email = "tsann@punks.local" }]
+keywords = ["ai-detection", "screen-monitor", "sightengine", "pyqt5", "punks", "osiris"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: System :: Monitoring",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt5>=5.15.0",
+    "mss>=9.0.1",
+    "Pillow>=10.0.0",
+    "requests>=2.31.0",
+    "cryptography>=41.0.0",
+]
+
+[project.scripts]
+ai-sentinel = "ai_sentinel:main"
+
+[project.urls]
+Homepage = "https://github.com/tsann/ai-sentinel"
+Repository = "https://github.com/tsann/ai-sentinel"
+Issues = "https://github.com/tsann/ai-sentinel/issues"
+Changelog = "https://github.com/tsann/ai-sentinel/blob/main/CHANGELOG.md"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501", "F841"]
+exclude = [".venv", "build", "dist", "*.build"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+no_implicit_optional = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
