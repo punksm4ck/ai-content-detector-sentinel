@@ -82,7 +82,7 @@ sudo apt install python3-pyqt5 python3-pyqt5.qtsvg libxcb-cursor0 notify-send
 ### 1. Clone
 
 ```bash
-git clone https://github.com/tsann/ai-sentinel.git
+git clone https://github.com/punksm4ck/ai-content-detector-sentinel.git
 cd ai-sentinel
 ```
 
@@ -203,11 +203,20 @@ ai-sentinel/
 
 ## Roadmap
 
-- [ ] Upgrade to **AI Sentinel Pro v3.0** (SQLite log, 5 badge styles, heatmap, webhook alerts, Bloom filter dedup, encrypted credential store)
+- [x] AI Sentinel Pro v3.0 — SQLite log, 5 badge styles, heatmap, webhook alerts, Bloom filter dedup, encrypted credential store
+- [x] AI Sentinel Pro v4.0 — event-driven architecture, OS focus hooks, accessibility tree media detection, zero CPU at idle
 - [ ] PyQt6 migration
 - [ ] Wayland native support
 - [ ] `--onefile` Nuitka distribution
 - [ ] GitHub Actions automated release builds
+
+---
+
+## Related Projects
+
+| Repo | Description |
+|---|---|
+| [ai-content-detector-sentinel-diag-suite](https://github.com/punksm4ck/ai-content-detector-sentinel-diag-suite) | Companion diagnostic suite — live motion emulator, system health reporter, batch scanner |
 
 ---
 
